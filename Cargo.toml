@@ -1,5 +1,5 @@
 [package]
-description = "Parses linux `ls` command output"
+description = "Parses `ls -lpa` command output"
 edition = "2024"
 license = "MIT"
 name = "linux-ls-parser"
