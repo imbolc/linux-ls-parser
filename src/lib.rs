@@ -58,6 +58,153 @@ pub enum ErrorKind {
     InvalidEscapeSequence,
 }
 
+impl std::str::FromStr for LsOutput {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut files = Vec::new();
+        let mut folders = Vec::new();
+        let input = s
+            .strip_prefix("\\\r\n")
+            .or_else(|| s.strip_prefix("\\\n"))
+            .unwrap_or(s);
+
+        for raw_line in input.lines() {
+            let line = raw_line.trim();
+
+            let parsed = parse_line(line).map_err(|kind| Error::new(kind, line.to_string()))?;
+
+            if let Some(parsed) = parsed {
+                match parsed {
+                    ParsedLine::File(file) => files.push(file),
+                    ParsedLine::Folder(folder) => folders.push(folder),
+                }
+            }
+        }
+
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        folders.sort();
+
+        Ok(Self { files, folders })
+    }
+}
+
+fn unescape_double_quoted(input: &str) -> Result<String, ErrorKind> {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let escaped = chars.next().ok_or(ErrorKind::InvalidEscapeSequence)?;
+            result.push(match escaped {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+        } else {
+            result.push(ch);
+        }
+    }
+
+    Ok(result)
+}
+
+fn parse_name(raw: &str) -> Result<String, ErrorKind> {
+    if raw.is_empty() {
+        return Err(ErrorKind::MissingName);
+    }
+
+    if raw.len() >= 2 {
+        let bytes = raw.as_bytes();
+        if bytes[0] == b'"' && bytes[raw.len() - 1] == b'"' {
+            let value = unescape_double_quoted(&raw[1..raw.len() - 1])?;
+            if value.is_empty() {
+                return Err(ErrorKind::EmptyQuotedName);
+            }
+            return Ok(value);
+        }
+
+        if bytes[0] == b'\'' && bytes[raw.len() - 1] == b'\'' {
+            let value = &raw[1..raw.len() - 1];
+            if value.is_empty() {
+                return Err(ErrorKind::EmptyQuotedName);
+            }
+            return Ok(value.to_string());
+        }
+    }
+
+    Ok(raw.to_string())
+}
+
+enum ParsedLine {
+    File(LsOutputFile),
+    Folder(String),
+}
+
+fn parse_line(line: &str) -> Result<Option<ParsedLine>, ErrorKind> {
+    if line.is_empty() || line.starts_with("total ") {
+        return Ok(None);
+    }
+
+    let mut parts = line.split_whitespace();
+    let file_mode = parts.next().ok_or(ErrorKind::MissingFileMode)?;
+    if file_mode.len() == 10 {
+        match file_mode.as_bytes()[0] {
+            b'l' => return Ok(None), // skip symlinks
+            b'b' => return Ok(None), // skip block devices
+            b'c' => return Ok(None), // skip char devices
+            _ => {}
+        }
+    }
+
+    // Skip link count, owner and group info. We only care about size.
+    parts.next().ok_or(ErrorKind::MissingLinkCount)?;
+    parts.next().ok_or(ErrorKind::MissingOwner)?;
+    parts.next().ok_or(ErrorKind::MissingGroup)?;
+
+    let size_token = parts.next().ok_or(ErrorKind::MissingSize)?;
+    let size: i64 = size_token.parse().map_err(|_| ErrorKind::InvalidSize {
+        token: size_token.to_string(),
+    })?;
+
+    // Skip month, day and time/year columns.
+    parts.next().ok_or(ErrorKind::MissingMonth)?;
+    parts.next().ok_or(ErrorKind::MissingDay)?;
+    parts.next().ok_or(ErrorKind::MissingTimestamp)?;
+
+    let mut raw_name = parts.collect::<Vec<_>>().join(" ");
+    if raw_name.is_empty() {
+        return Err(ErrorKind::MissingName);
+    }
+
+    let is_directory = raw_name.ends_with('/');
+    if is_directory {
+        while raw_name.ends_with('/') {
+            raw_name.pop();
+        }
+    }
+
+    let name = parse_name(&raw_name)?;
+
+    if name == "." || name == ".." {
+        return Ok(None);
+    }
+
+    if is_directory {
+        if name.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(ParsedLine::Folder(name)))
+    } else {
+        Ok(Some(ParsedLine::File(LsOutputFile {
+            name,
+            size_bytes: size,
+        })))
+    }
+}
+
 impl Error {
     fn new(kind: ErrorKind, line: String) -> Self {
         Self { kind, line }
@@ -90,158 +237,6 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
-
-impl std::str::FromStr for LsOutput {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        fn unescape_double_quoted(input: &str) -> Result<String, ErrorKind> {
-            let mut result = String::with_capacity(input.len());
-            let mut chars = input.chars();
-
-            while let Some(ch) = chars.next() {
-                if ch == '\\' {
-                    let escaped = chars.next().ok_or(ErrorKind::InvalidEscapeSequence)?;
-                    result.push(match escaped {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        other => other,
-                    });
-                } else {
-                    result.push(ch);
-                }
-            }
-
-            Ok(result)
-        }
-
-        fn normalize_name(raw: &str) -> Result<String, ErrorKind> {
-            if raw.is_empty() {
-                return Err(ErrorKind::MissingName);
-            }
-
-            if raw.len() >= 2 {
-                let bytes = raw.as_bytes();
-                if bytes[0] == b'"' && bytes[raw.len() - 1] == b'"' {
-                    let value = unescape_double_quoted(&raw[1..raw.len() - 1])?;
-                    if value.is_empty() {
-                        return Err(ErrorKind::EmptyQuotedName);
-                    }
-                    return Ok(value);
-                }
-
-                if bytes[0] == b'\'' && bytes[raw.len() - 1] == b'\'' {
-                    let value = &raw[1..raw.len() - 1];
-                    if value.is_empty() {
-                        return Err(ErrorKind::EmptyQuotedName);
-                    }
-                    return Ok(value.to_string());
-                }
-            }
-
-            Ok(raw.to_string())
-        }
-
-        let mut files = Vec::new();
-        let mut folders = Vec::new();
-        let input = s
-            .strip_prefix("\\\r\n")
-            .or_else(|| s.strip_prefix("\\\n"))
-            .unwrap_or(s);
-
-        for raw_line in input.lines() {
-            let line = raw_line.trim();
-
-            if line.is_empty() || line.starts_with("total ") {
-                continue;
-            }
-
-            let mut parts = line.split_whitespace();
-            let file_mode = parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingFileMode, line.to_string()))?;
-            if file_mode.len() == 10 {
-                match file_mode.as_bytes()[0] {
-                    b'l' => continue, // skip symlinks
-                    b'b' => continue, // skip block devices
-                    b'c' => continue, // skip char devices
-                    _ => {}
-                }
-            }
-
-            // Skip link count, owner and group info. We only care about size.
-            parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingLinkCount, line.to_string()))?;
-            parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingOwner, line.to_string()))?;
-            parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingGroup, line.to_string()))?;
-
-            let size_token = parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingSize, line.to_string()))?;
-            let size: i64 = size_token.parse().map_err(|_| {
-                Error::new(
-                    ErrorKind::InvalidSize {
-                        token: size_token.to_string(),
-                    },
-                    line.to_string(),
-                )
-            })?;
-
-            // Skip month, day and time/year columns.
-            parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingMonth, line.to_string()))?;
-            parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingDay, line.to_string()))?;
-            parts
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::MissingTimestamp, line.to_string()))?;
-
-            let mut name = parts.collect::<Vec<_>>().join(" ");
-            if name.is_empty() {
-                return Err(Error::new(ErrorKind::MissingName, line.to_string()));
-            }
-
-            let is_directory = name.ends_with('/');
-            if is_directory {
-                while name.ends_with('/') {
-                    name.pop();
-                }
-            }
-
-            let name = normalize_name(&name).map_err(|kind| Error::new(kind, line.to_string()))?;
-
-            if name == "." || name == ".." {
-                continue;
-            }
-
-            if is_directory {
-                if name.is_empty() {
-                    continue;
-                }
-
-                folders.push(name);
-            } else {
-                files.push(LsOutputFile {
-                    name,
-                    size_bytes: size,
-                });
-            }
-        }
-
-        files.sort_by(|a, b| a.name.cmp(&b.name));
-        folders.sort();
-
-        Ok(Self { files, folders })
-    }
-}
 
 #[cfg(test)]
 mod tests {
