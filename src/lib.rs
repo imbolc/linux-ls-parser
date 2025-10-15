@@ -17,17 +17,91 @@ pub struct LsOutputFile {
     pub size_bytes: i64,
 }
 
+/// Parsing error with the offending input line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error {
+    /// Specific parsing failure.
+    pub kind: ErrorKind,
+    /// The line that failed to parse.
+    pub line: String,
+}
+
+/// Possible parsing error kinds when processing `ls -lpa` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Missing file mode column.
+    MissingFileMode,
+    /// Missing link count column.
+    MissingLinkCount,
+    /// Missing owner column.
+    MissingOwner,
+    /// Missing group column.
+    MissingGroup,
+    /// Missing size column.
+    MissingSize,
+    /// Found a size column that is not a number.
+    InvalidSize {
+        /// The token that failed to parse.
+        token: String,
+    },
+    /// Missing timestamp month column.
+    MissingMonth,
+    /// Missing timestamp day column.
+    MissingDay,
+    /// Missing timestamp time or year column.
+    MissingTimestamp,
+    /// Missing file or directory name.
+    MissingName,
+    /// Found an empty quoted name.
+    EmptyQuotedName,
+    /// Found an unterminated escape sequence in a quoted name.
+    InvalidEscapeSequence,
+}
+
+impl Error {
+    fn new(kind: ErrorKind, line: String) -> Self {
+        Self { kind, line }
+    }
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFileMode => write!(f, "missing file mode field"),
+            Self::MissingLinkCount => write!(f, "missing link count field"),
+            Self::MissingOwner => write!(f, "missing owner field"),
+            Self::MissingGroup => write!(f, "missing group field"),
+            Self::MissingSize => write!(f, "missing size field"),
+            Self::InvalidSize { token } => write!(f, "invalid size value `{token}`"),
+            Self::MissingMonth => write!(f, "missing timestamp month field"),
+            Self::MissingDay => write!(f, "missing timestamp day field"),
+            Self::MissingTimestamp => write!(f, "missing timestamp time or year field"),
+            Self::MissingName => write!(f, "missing file name"),
+            Self::EmptyQuotedName => write!(f, "empty quoted file name"),
+            Self::InvalidEscapeSequence => write!(f, "unterminated escape sequence in file name"),
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} in line `{}`", self.kind, self.line)
+    }
+}
+
+impl std::error::Error for Error {}
+
 impl std::str::FromStr for LsOutput {
-    type Err = ();
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        fn unescape_double_quoted(input: &str) -> Result<String, ()> {
+        fn unescape_double_quoted(input: &str) -> Result<String, ErrorKind> {
             let mut result = String::with_capacity(input.len());
             let mut chars = input.chars();
 
             while let Some(ch) = chars.next() {
                 if ch == '\\' {
-                    let escaped = chars.next().ok_or(())?;
+                    let escaped = chars.next().ok_or(ErrorKind::InvalidEscapeSequence)?;
                     result.push(match escaped {
                         'n' => '\n',
                         'r' => '\r',
@@ -42,9 +116,9 @@ impl std::str::FromStr for LsOutput {
             Ok(result)
         }
 
-        fn normalize_name(raw: &str) -> Result<String, ()> {
+        fn normalize_name(raw: &str) -> Result<String, ErrorKind> {
             if raw.is_empty() {
-                return Err(());
+                return Err(ErrorKind::MissingName);
             }
 
             if raw.len() >= 2 {
@@ -52,7 +126,7 @@ impl std::str::FromStr for LsOutput {
                 if bytes[0] == b'"' && bytes[raw.len() - 1] == b'"' {
                     let value = unescape_double_quoted(&raw[1..raw.len() - 1])?;
                     if value.is_empty() {
-                        return Err(());
+                        return Err(ErrorKind::EmptyQuotedName);
                     }
                     return Ok(value);
                 }
@@ -60,7 +134,7 @@ impl std::str::FromStr for LsOutput {
                 if bytes[0] == b'\'' && bytes[raw.len() - 1] == b'\'' {
                     let value = &raw[1..raw.len() - 1];
                     if value.is_empty() {
-                        return Err(());
+                        return Err(ErrorKind::EmptyQuotedName);
                     }
                     return Ok(value.to_string());
                 }
@@ -84,36 +158,55 @@ impl std::str::FromStr for LsOutput {
             }
 
             let mut parts = line.split_whitespace();
-            parts.next().ok_or(())?;
+            let file_mode = parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingFileMode, line.to_string()))?;
+            if file_mode.len() == 10 {
+                match file_mode.as_bytes()[0] {
+                    b'l' => continue, // skip symlinks
+                    b'b' => continue, // skip block devices
+                    b'c' => continue, // skip char devices
+                    _ => {}
+                }
+            }
 
             // Skip link count, owner and group info. We only care about size.
-            parts.next().ok_or(())?;
-            parts.next().ok_or(())?;
-            parts.next().ok_or(())?;
+            parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingLinkCount, line.to_string()))?;
+            parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingOwner, line.to_string()))?;
+            parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingGroup, line.to_string()))?;
 
-            let size_token = parts.next().ok_or(())?;
-            let size: i64 = match size_token.parse() {
-                Ok(value) => value,
-                Err(_) if size_token.ends_with(',') => {
-                    // Device files use "major, minor". Skip the minor value.
-                    parts.next().ok_or(())?;
-                    0
-                }
-                Err(_) => return Err(()),
-            };
+            let size_token = parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingSize, line.to_string()))?;
+            let size: i64 = size_token.parse().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidSize {
+                        token: size_token.to_string(),
+                    },
+                    line.to_string(),
+                )
+            })?;
 
             // Skip month, day and time/year columns.
-            parts.next().ok_or(())?;
-            parts.next().ok_or(())?;
-            parts.next().ok_or(())?;
+            parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingMonth, line.to_string()))?;
+            parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingDay, line.to_string()))?;
+            parts
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::MissingTimestamp, line.to_string()))?;
 
             let mut name = parts.collect::<Vec<_>>().join(" ");
             if name.is_empty() {
-                return Err(());
-            }
-
-            if let Some(idx) = name.find(" -> ") {
-                name.truncate(idx);
+                return Err(Error::new(ErrorKind::MissingName, line.to_string()));
             }
 
             let is_directory = name.ends_with('/');
@@ -123,7 +216,7 @@ impl std::str::FromStr for LsOutput {
                 }
             }
 
-            let name = normalize_name(&name)?;
+            let name = normalize_name(&name).map_err(|kind| Error::new(kind, line.to_string()))?;
 
             if name == "." || name == ".." {
                 continue;
@@ -179,6 +272,7 @@ drwxr-xr-x  4 user user  4096 Jan  1 12:02 alpha/
 total 12
 drwxr-xr-x  5 root root 4096 Jan  1 00:00 ./
 drwxr-xr-x  5 root root 4096 Jan  1 00:00 ../
+-rw-r--r--  1 root root   16 Jan  1 00:01 arrow -> name
 -rw-r--r--  1 root root   16 Jan  1 00:01 notes.txt
 -rw-r--r--  1 root root    8 Jan  1 00:02 .hidden
 ";
@@ -186,26 +280,39 @@ drwxr-xr-x  5 root root 4096 Jan  1 00:00 ../
         let output = LsOutput::from_str(input).unwrap();
 
         assert_eq!(output.folders.len(), 0);
-        assert_eq!(output.files.len(), 2);
+        assert_eq!(output.files.len(), 3);
         let files: Vec<(&str, i64)> = output
             .files
             .iter()
             .map(|f| (f.name.as_str(), f.size_bytes))
             .collect();
-        assert_eq!(files, vec![(".hidden", 8), ("notes.txt", 16)]);
+        assert_eq!(
+            files,
+            vec![(".hidden", 8), ("arrow -> name", 16), ("notes.txt", 16)]
+        );
     }
 
     #[test]
-    fn synlinks() {
+    fn ignores_symlinks() {
         let input = "\
 lrwxrwxrwx  1 user user     6 Jan  1 12:04 link -> target
 ";
 
         let output: LsOutput = input.parse().unwrap();
         assert_eq!(output.folders.len(), 0);
-        assert_eq!(output.files.len(), 1);
-        assert_eq!(output.files[0].name, "link");
-        assert_eq!(output.files[0].size_bytes, 6);
+        assert_eq!(output.files.len(), 0);
+    }
+
+    #[test]
+    fn ignores_device_files() {
+        let input = "\
+brw-rw----  1 root disk 8, 0 Jan  1 12:00 sda
+crw-rw----  1 root disk 8, 1 Jan  1 12:00 sda1
+";
+
+        let output: LsOutput = input.parse().unwrap();
+        assert_eq!(output.folders.len(), 0);
+        assert_eq!(output.files.len(), 0);
     }
 
     #[test]
@@ -234,6 +341,16 @@ drwxrwxr-x 2 imbolc imbolc 4096 Oct 14 10:49 "let's play"/
         assert_eq!(output.folders[0], "let's play");
         assert_eq!(output.files.len(), 1);
         assert_eq!(output.files[0].name, "давай играть");
+    }
+
+    #[test]
+    fn error_includes_offending_line() {
+        let err = match "broken line".parse::<LsOutput>() {
+            Err(err) => err,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err.to_string().contains("broken line"));
+        assert_eq!(err.line, "broken line");
     }
 
     #[test]

@@ -4,7 +4,9 @@
 [![Crates.io](https://img.shields.io/crates/v/linux-ls-parser.svg)](https://crates.io/crates/linux-ls-parser)
 [![Docs.rs](https://docs.rs/linux-ls-parser/badge.svg)](https://docs.rs/linux-ls-parser)
 
-Parses files and folders from output of `ls -lpa` Linux command.
+Parses files and folders from the output of the `ls -lpa` Linux command.
+
+Device files and symlinks are currently ignored. If you need them, submit a PR.
 
 ## Contributing
 
